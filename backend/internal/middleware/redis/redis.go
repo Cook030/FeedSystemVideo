@@ -113,3 +113,10 @@ func (c *Client) IncrementWithExpire(ctx context.Context, key string, expire tim
 		expire.Milliseconds(),
 	).Int64()
 }
+
+func (c *Client) Pipeline() redis.Pipeliner {
+	if c == nil || c.rdb == nil {
+		return nil
+	}
+	return c.rdb.Pipeline()
+}

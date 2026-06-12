@@ -23,7 +23,7 @@ type VideoService struct {
 }
 
 func NewVideoService(repo *VideoRepository, cache *rediscache.Client, popularityMQ *rabbitmq.PopularityMQ) *VideoService {
-	return &VideoService{repo: repo, cache: cache, cacheTTL: 5 * time.Minute, popularityMQ: popularityMQ}
+	return &VideoService{repo: repo, cache: cache, cacheTTL: 10 * time.Minute, popularityMQ: popularityMQ}
 }
 
 func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
@@ -88,7 +88,7 @@ func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) erro
 		return err
 	}
 	if vs.cache != nil {
-		cacheKey := vs.cache.Key("video:detail:id=%d", id)
+		cacheKey := vs.cache.Key("video:entity:%d", id)
 		_ = vs.cache.Del(context.Background(), cacheKey)
 	}
 	return nil
@@ -103,7 +103,7 @@ func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint) ([]Vi
 }
 
 func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) {
-	cacheKey := vs.cache.Key("video:detail:id=%d", id)
+	cacheKey := vs.cache.Key("video:entity:%d", id)
 
 	getCached := func() (*Video, bool) {
 		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
@@ -209,7 +209,7 @@ func (vs *VideoService) UpdatePopularity(ctx context.Context, id uint, change in
 
 	if vs.cache != nil {
 		// 1) 详情缓存：直接失效（最简单靠谱）
-		_ = vs.cache.Del(context.Background(), vs.cache.Key("video:detail:id=%d", id))
+		_ = vs.cache.Del(context.Background(), vs.cache.Key("video:entity:%d", id))
 
 		// 2) 热榜：写到“时间窗ZSET”，不要用 detail key
 		now := time.Now().UTC().Truncate(time.Minute)

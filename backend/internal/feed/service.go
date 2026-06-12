@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/patrickmn/go-cache"
 	redis "github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
@@ -20,7 +19,7 @@ type FeedService struct {
 	repo         *FeedRepository
 	likeRepo     *video.LikeRepository
 	rediscache   *rediscache.Client
-	localcache   *cache.Cache
+	localCache   *localVideoCache
 	cacheTTL     time.Duration
 	requestGroup singleflight.Group
 }
@@ -29,8 +28,64 @@ type CachedFeedData struct {
 	PublicVideos []video.Video `json:"public_videos"`
 }
 
+// localVideoCache 进程内轻量缓存：TTL + 最大条目数，无额外 goroutine
+
+type localVideoCache struct {
+	mu         sync.RWMutex
+	items      map[uint]localCacheItem
+	ttl        time.Duration
+	maxEntries int
+}
+
+type localCacheItem struct {
+	video    video.Video
+	expireAt time.Time
+}
+
+func newLocalVideoCache(ttl time.Duration, maxEntries int) *localVideoCache {
+	return &localVideoCache{
+		items:      make(map[uint]localCacheItem),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+	}
+}
+
+func (c *localVideoCache) get(id uint) (video.Video, bool) {
+	c.mu.RLock()
+	item, ok := c.items[id]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(item.expireAt) {
+		return video.Video{}, false
+	}
+	return item.video, true
+}
+
+func (c *localVideoCache) set(id uint, v video.Video) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.items) >= c.maxEntries {
+		now := time.Now()
+		for k, item := range c.items {
+			if now.After(item.expireAt) {
+				delete(c.items, k)
+			}
+		}
+		if len(c.items) >= c.maxEntries {
+			for k := range c.items {
+				delete(c.items, k)
+				if len(c.items) < c.maxEntries {
+					break
+				}
+			}
+		}
+	}
+
+	c.items[id] = localCacheItem{video: v, expireAt: time.Now().Add(c.ttl)}
+}
+
 func NewFeedService(repo *FeedRepository, likeRepo *video.LikeRepository, rediscache *rediscache.Client) *FeedService {
-	return &FeedService{repo: repo, likeRepo: likeRepo, rediscache: rediscache, localcache: cache.New(3*time.Second, 5*time.Second), cacheTTL: 24 * time.Hour}
+	return &FeedService{repo: repo, likeRepo: likeRepo, rediscache: rediscache, localCache: newLocalVideoCache(30*time.Second, 50000), cacheTTL: 10 * time.Minute}
 }
 
 func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*video.Video, error) {
@@ -41,19 +96,14 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 	}
 
 	videoMap := make(map[uint]*video.Video)
-	//L1:本地缓存
+	// L1:本地缓存
 	var missedL1 []uint
 	for _, id := range videoIDs {
-		cacheKey := f.rediscache.Key("video:entity:%d", id)
-		if f.localcache != nil {
-			if v, found := f.localcache.Get(cacheKey); found {
-				if data, ok := v.(video.Video); ok {
-					videoMap[id] = &data
-					continue
-				}
-			}
+		if v, ok := f.localCache.get(id); ok {
+			copy := v
+			videoMap[id] = &copy
+			continue
 		}
-		// 记录未命中的 ID，准备进入下一级缓存
 		missedL1 = append(missedL1, id)
 	}
 
@@ -61,87 +111,116 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		return buildOrderedResult(videoIDs, videoMap), nil
 	}
 
-	//L2:redis
+	// L2:Redis
 	var missedL2 []uint
-	if len(missedL1) > 0 {
-		cacheKeys := make([]string, len(missedL1))
-		for i, id := range missedL1 {
-			cacheKeys[i] = f.rediscache.Key("video:entity:%d", id)
-		}
+	cacheKeys := make([]string, len(missedL1))
+	for i, id := range missedL1 {
+		cacheKeys[i] = f.rediscache.Key("video:entity:%d", id)
+	}
 
-		cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		results, err := f.rediscache.MGet(cacheCtx, cacheKeys...)
-		cancel()
+	cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	results, err := f.rediscache.MGet(cacheCtx, cacheKeys...)
+	cancel()
 
-		if err == nil {
-			for i, res := range results {
-				id := missedL1[i]
-				if res != nil {
-					if str, ok := res.(string); ok {
-						var v video.Video
-						if err := json.Unmarshal([]byte(str), &v); err == nil {
-							videoMap[id] = &v
-							// 回写更新 L1 本地缓存
-							if f.localcache != nil {
-								f.localcache.Set(cacheKeys[i], v, 5*time.Second)
-							}
-							continue
-						}
+	if err == nil {
+		for i, res := range results {
+			id := missedL1[i]
+			if res != nil {
+				if str, ok := res.(string); ok {
+					var v video.Video
+					if err := json.Unmarshal([]byte(str), &v); err == nil {
+						videoMap[id] = &v
+						f.localCache.set(id, v)
+						continue
 					}
 				}
-				missedL2 = append(missedL2, id)
 			}
-		} else {
-			// 如果 Redis 挂了或者超时了，全部降级到 L3
-			missedL2 = missedL1
-			log.Printf("L2 Redis MGet 失败，全部降级到 MySQL: %v", err)
+			missedL2 = append(missedL2, id)
 		}
+	} else {
+		missedL2 = missedL1
+		log.Printf("L2 Redis MGet 失败，全部降级到 MySQL: %v", err)
 	}
 
 	if len(missedL2) == 0 {
 		return buildOrderedResult(videoIDs, videoMap), nil
 	}
 
-	//L3:MySQL
+	// L3:MySQL + singleflight + 批量回写 L2
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	type cacheEntry struct {
+		key string
+		val []byte
+	}
+	var cacheEntries []cacheEntry
+
 	for _, id := range missedL2 {
 		wg.Add(1)
 		go func(videoID uint) {
 			defer wg.Done()
 			sfKey := f.rediscache.Key("sf:entity:%d", videoID)
 
-			v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
+			ch := f.requestGroup.DoChan(sfKey, func() (interface{}, error) {
 				videoList, err := f.repo.GetByIDs(ctx, []uint{videoID})
-
 				if err != nil || len(videoList) == 0 {
 					return nil, err
 				}
-
-				safeCopy := *videoList[0]
-				cachekey := f.rediscache.Key("video:entity:%d", safeCopy.ID)
-				if b, err := json.Marshal(safeCopy); err == nil {
-					//异步回写redis
-					go func(k string, b []byte) {
-						setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-						defer setCancel()
-
-						f.rediscache.SetBytes(setCtx, k, b, time.Hour)
-					}(cachekey, b)
-				}
-				return videoList[0], err
+				return videoList[0], nil
 			})
 
-			if err == nil && v != nil {
-				safeCopy := *(v.(*video.Video))
+			select {
+			case <-ctx.Done():
+				return
+			case res := <-ch:
+				if res.Err != nil || res.Val == nil {
+					return
+				}
+				v := res.Val.(*video.Video)
+				safeCopy := *v
+
 				mu.Lock()
-				videoMap[id] = &safeCopy
+				videoMap[videoID] = &safeCopy
 				mu.Unlock()
-				f.localcache.Set(f.rediscache.Key("video:entity:%d", safeCopy.ID), safeCopy, 5*time.Second)
+				f.localCache.set(videoID, safeCopy)
+
+				cachekey := f.rediscache.Key("video:entity:%d", safeCopy.ID)
+				if b, err := json.Marshal(safeCopy); err == nil {
+					mu.Lock()
+					cacheEntries = append(cacheEntries, cacheEntry{key: cachekey, val: b})
+					mu.Unlock()
+				}
 			}
 		}(id)
 	}
 	wg.Wait()
+
+	// 批量回写 L2（Pipeline + 一次重试）
+	if len(cacheEntries) > 0 {
+		go func(entries []cacheEntry) {
+			setCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			pipe := f.rediscache.Pipeline()
+			if pipe != nil {
+				for _, e := range entries {
+					pipe.Set(setCtx, e.key, e.val, f.cacheTTL)
+				}
+				if _, err := pipe.Exec(setCtx); err != nil {
+					// 降级为逐个重试一次
+					time.Sleep(50 * time.Millisecond)
+					for _, e := range entries {
+						_ = f.rediscache.SetBytes(setCtx, e.key, e.val, f.cacheTTL)
+					}
+				}
+			} else {
+				for _, e := range entries {
+					_ = f.rediscache.SetBytes(setCtx, e.key, e.val, f.cacheTTL)
+				}
+			}
+		}(cacheEntries)
+	}
+
 	return buildOrderedResult(videoIDs, videoMap), nil
 }
 

@@ -13,6 +13,11 @@ import (
 
 func setupSSE(r *gin.Engine, db *gorm.DB, rmq *rabbitmq.RabbitMQ) {
 	if rmq != nil && rmq.Ch != nil {
+		//生产者 （比如点赞 Service）发送消息时，
+		// 指定 routing_key = like.like ，
+		// 消息会先到达 like.events 这个 Exchange，
+		// 然后被路由到 notification.like 队列。
+		// 消费者 （SSE Worker）从这个队列里取出消息，推送给浏览器。
 		rmq.DeclareTopic("like.events", "notification.like", "like.like")
 		rmq.DeclareTopic("comment.events", "notification.comment", "comment.publish")
 		rmq.DeclareTopic("social.events", "notification.social", "social.follow")
